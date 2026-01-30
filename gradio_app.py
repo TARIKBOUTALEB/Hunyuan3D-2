@@ -304,6 +304,64 @@ def generation_all(
     )
 
 
+def load_mesh_from_file(mesh_path):
+    mesh = trimesh.load(mesh_path, force='mesh')
+    if isinstance(mesh, trimesh.Scene):
+        if not mesh.geometry:
+            raise gr.Error('The uploaded file does not contain any mesh geometry.')
+        mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
+    if not hasattr(mesh, 'faces') or mesh.faces is None:
+        raise gr.Error('Failed to parse a valid mesh from the uploaded file.')
+    return mesh
+
+
+def save_texture_map(textured_mesh, save_folder):
+    texture_image = None
+    if hasattr(textured_mesh.visual, 'material'):
+        texture_image = getattr(textured_mesh.visual.material, 'image', None)
+    if texture_image is None and hasattr(textured_mesh.visual, 'image'):
+        texture_image = textured_mesh.visual.image
+    if texture_image is None:
+        return None, None
+    texture_path = os.path.join(save_folder, 'texture_map.png')
+    texture_image.save(texture_path)
+    return texture_image, texture_path
+
+
+def texture_from_mesh(
+    mesh_file=None,
+    image=None,
+    check_box_rembg=False,
+):
+    if not HAS_TEXTUREGEN:
+        raise gr.Error('Texture synthesis is disabled. Please install requirements first.')
+    if mesh_file is None:
+        raise gr.Error('Please upload a mesh file.')
+    if image is None:
+        raise gr.Error('Please upload a reference image.')
+
+    mesh = load_mesh_from_file(mesh_file)
+    if check_box_rembg and image.mode == "RGB":
+        image = rmbg_worker(image)
+
+    save_folder = gen_save_folder()
+    textured_mesh = texgen_worker(mesh, image)
+    path_untextured = export_mesh(mesh, save_folder, textured=False)
+    path_textured = export_mesh(textured_mesh, save_folder, textured=True)
+    model_viewer_html_textured = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH,
+                                                         textured=True)
+    texture_image, texture_path = save_texture_map(textured_mesh, save_folder)
+    if args.low_vram_mode:
+        torch.cuda.empty_cache()
+    return (
+        gr.update(value=path_untextured),
+        gr.update(value=path_textured),
+        model_viewer_html_textured,
+        gr.update(value=texture_image),
+        gr.update(value=texture_path, interactive=texture_path is not None),
+    )
+
+
 def shape_generation(
     caption=None,
     image=None,
@@ -414,6 +472,10 @@ def build_app():
                                                      min_width=100, elem_classes='mv-image')
                             mv_image_right = gr.Image(label='Right', type='pil', image_mode='RGBA', height=140,
                                                       min_width=100, elem_classes='mv-image')
+                    with gr.Tab('Mesh Input', id='tab_mesh_input', visible=HAS_TEXTUREGEN):
+                        mesh_file = gr.File(label='Mesh File', file_types=MESH_IMPORT_FORMATS, type='filepath')
+                        mesh_image = gr.Image(label='Reference Image', type='pil', image_mode='RGBA', height=290)
+                        mesh_remove_bg = gr.Checkbox(value=True, label='Remove Background', min_width=100)
 
                 with gr.Row():
                     btn = gr.Button(value='Gen Shape', variant='primary', min_width=100)
@@ -421,6 +483,10 @@ def build_app():
                                         variant='primary',
                                         visible=HAS_TEXTUREGEN,
                                         min_width=100)
+                    btn_texture = gr.Button(value='Texture From Mesh',
+                                            variant='primary',
+                                            visible=HAS_TEXTUREGEN,
+                                            min_width=100)
 
                 with gr.Group():
                     file_out = gr.File(label="File", visible=False)
@@ -479,6 +545,11 @@ def build_app():
                         html_export_mesh = gr.HTML(HTML_OUTPUT_PLACEHOLDER, label='Output')
                     with gr.Tab('Mesh Statistic', id='stats_panel'):
                         stats = gr.Json({}, label='Mesh Stats')
+                    with gr.Tab('Texture Map', id='texture_map_panel'):
+                        texture_map = gr.Image(label='Texture Map', type='pil')
+                        texture_download = gr.DownloadButton(label='Download Texture Map',
+                                                             variant='primary',
+                                                             interactive=False)
 
             with gr.Column(scale=3 if MV_MODE else 2):
                 with gr.Tabs(selected='tab_img_gallery') as gallery:
@@ -567,6 +638,23 @@ def build_app():
                 randomize_seed,
             ],
             outputs=[file_out, file_out2, html_gen_mesh, stats, seed]
+        ).then(
+            lambda: (gr.update(visible=True, value=True), gr.update(interactive=False), gr.update(interactive=True),
+                     gr.update(interactive=False)),
+            outputs=[export_texture, reduce_face, confirm_export, file_export],
+        ).then(
+            lambda: gr.update(selected='gen_mesh_panel'),
+            outputs=[tabs_output],
+        )
+
+        btn_texture.click(
+            texture_from_mesh,
+            inputs=[
+                mesh_file,
+                mesh_image,
+                mesh_remove_bg,
+            ],
+            outputs=[file_out, file_out2, html_gen_mesh, texture_map, texture_download]
         ).then(
             lambda: (gr.update(visible=True, value=True), gr.update(interactive=False), gr.update(interactive=True),
                      gr.update(interactive=False)),
@@ -688,6 +776,7 @@ if __name__ == '__main__':
     example_mvs = get_example_mv_list()
 
     SUPPORTED_FORMATS = ['glb', 'obj', 'ply', 'stl']
+    MESH_IMPORT_FORMATS = ['.glb', '.obj', '.ply', '.stl', '.fbx']
 
     HAS_TEXTUREGEN = False
     if not args.disable_tex:
